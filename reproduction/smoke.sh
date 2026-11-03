@@ -7,7 +7,7 @@ cd "$root/code"
 export PYTHONPATH="$PWD:$PWD/verl${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export CUDA_VISIBLE_DEVICES=''
-export MEDTIV_SMOKE_GPU=0
+export MEDTIV_SMOKE_DEVICES=0,3
 model="$root/models/Qwen2.5-7B-Instruct"
 output="$root/outputs/smoke/integration-v1"
 export MEDTIV_RAY_TMPDIR="$root/tmp/smoke"
@@ -23,7 +23,7 @@ gpu_rows=subprocess.check_output(['nvidia-smi','--query-gpu=index,uuid,memory.us
 gpus={int(v[0]):(v[1].strip(),int(v[2])) for line in gpu_rows.splitlines() if (v:=line.split(','))}
 apps=subprocess.check_output(['nvidia-smi','--query-compute-apps=gpu_uuid,pid','--format=csv,noheader,nounits'],text=True)
 active={line.split(',')[0].strip() for line in apps.splitlines()}
-if any(i not in gpus or gpus[i][1]>1024 or gpus[i][0] in active for i in [0]):raise RuntimeError('GPU0 are not idle')
+if any(i not in gpus or gpus[i][1]>1024 or gpus[i][0] in active for i in [0,3]):raise RuntimeError('GPUs 0,3 are not idle')
 train=pq.read_table(root/'data/prepared/train.parquet');labels=train['reward_model'].to_pylist()
 indices=list(range(len(labels)));random.Random(42).shuffle(indices)
 selected=[]; counts={'0':0,'1':0}
@@ -46,7 +46,7 @@ rows=subprocess.check_output(['nvidia-smi','--query-gpu=index,uuid,memory.used',
 gpus={int(v[0]):(v[1].strip(),int(v[2])) for line in rows.splitlines() if (v:=line.split(','))}
 apps=subprocess.check_output(['nvidia-smi','--query-compute-apps=gpu_uuid,pid','--format=csv,noheader,nounits'],text=True)
 active={line.split(',')[0].strip() for line in apps.splitlines()}
-if any(i not in gpus or gpus[i][1]>1024 or gpus[i][0] in active for i in [0]):raise RuntimeError('GPU0 became occupied during curriculum')
+if any(i not in gpus or gpus[i][1]>1024 or gpus[i][0] in active for i in [0,3]):raise RuntimeError('GPUs 0,3 became occupied during curriculum')
 GPUCHECK
 bash reproduction/train.sh 1 "$model" "$output/curriculum/train.parquet" \
   data.val_files="$output/validation.parquet" \
@@ -57,7 +57,7 @@ bash reproduction/train.sh 1 "$model" "$output/curriculum/train.parquet" \
   actor_rollout_ref.actor.optim.override_optimizer_config='{foreach:false}' \
   actor_rollout_ref.rollout.enforce_eager=True \
   actor_rollout_ref.rollout.val_kwargs.n=1 \
-  actor_rollout_ref.rollout.agent.num_workers=1 \
+  actor_rollout_ref.rollout.agent.num_workers=2 \
   trainer.total_training_steps=1 trainer.total_epochs=1 \
   trainer.test_freq=1 trainer.save_freq=-1 trainer.val_before_train=False \
   trainer.resume_mode=disable trainer.experiment_name=medtiv-integration-smoke-v1 \
