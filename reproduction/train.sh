@@ -13,7 +13,8 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export NCCL_DEBUG=WARN VLLM_USE_V1=1 WANDB_MODE=disabled
 export no_proxy="localhost,127.0.0.1,0.0.0.0,$(hostname -i)"
-export RAY_TMPDIR="$root/tmp/ray"
+runtime_dir=${MEDTIV_RUNTIME_DIR:-$root/outputs}
+export RAY_TMPDIR="$runtime_dir/ray"
 mkdir -p "$RAY_TMPDIR"
 val_data="$root/data/prepared/validation.parquet"
 rl_alg=grpo
@@ -51,13 +52,13 @@ additional_eos_token_ids=$(python -c 'from transformers import AutoTokenizer; im
 mask_observations=True
 enable_mtrl=False
 rollout_mode=async
-run_name="medtiv-qwen7b-iter${iteration}"
+run_name=${MEDTIV_RUN_NAME:-medtiv-qwen7b-iter${iteration}}
 export VERL_RUN_ID="$run_name"
 export MEDTIV_DRGRPO_NORMALIZER=8192
 checkpoint_dir="$root/outputs/iter${iteration}"
 tool_server_url=http://127.0.0.1:18502/get_observation
-action_stop_tokens_file="$root/outputs/action_stop_tokens.txt"
-mkdir -p "$root/outputs"
+action_stop_tokens_file="$runtime_dir/action_stop_tokens.txt"
+mkdir -p "$root/outputs" "$runtime_dir"
 printf '</search>,</answer>' > "$action_stop_tokens_file"
 PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     algorithm.adv_estimator=$rl_alg \
