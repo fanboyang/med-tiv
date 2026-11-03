@@ -12,8 +12,8 @@ export PYTHONPATH="$PWD:$PWD/verl${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 if [[ -n "${MEDTIV_SMOKE_DEVICES:-}" ]]; then
-  [[ "$MEDTIV_SMOKE_DEVICES" == 0,3 ]] || { echo 'Only GPUs 0,3 are allocated to the bounded smoke' >&2; exit 2; }
-  export CUDA_VISIBLE_DEVICES=0,3
+  [[ "$MEDTIV_SMOKE_DEVICES" == 0 ]] || { echo 'Only GPU0 is allocated to the bounded smoke' >&2; exit 2; }
+  export CUDA_VISIBLE_DEVICES=0
 fi
 export NCCL_DEBUG=WARN VLLM_USE_V1=1 WANDB_MODE=disabled
 export no_proxy="localhost,127.0.0.1,0.0.0.0,$(hostname -i)"
@@ -23,7 +23,7 @@ mkdir -p "$RAY_TMPDIR"
 val_data="$root/data/prepared/validation.parquet"
 rl_alg=grpo
 n_gpus_per_node=4
-[[ -z "${MEDTIV_SMOKE_DEVICES:-}" ]] || n_gpus_per_node=2
+[[ -z "${MEDTIV_SMOKE_DEVICES:-}" ]] || n_gpus_per_node=1
 n_nodes=1
 n=5
 [[ "$iteration" == 2 ]] && n=8
@@ -48,7 +48,7 @@ reward_manager=search_r1_qa_em
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
 tensor_model_parallel_size=4
-[[ -z "${MEDTIV_SMOKE_DEVICES:-}" ]] || tensor_model_parallel_size=2
+[[ -z "${MEDTIV_SMOKE_DEVICES:-}" ]] || tensor_model_parallel_size=1
 gpu_memory_utilization=0.55
 do_offload=True
 use_dynamic_bsz=True

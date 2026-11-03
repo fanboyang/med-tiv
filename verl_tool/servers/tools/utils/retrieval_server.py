@@ -41,12 +41,27 @@ def load_docs(corpus, doc_idxs):
     return results
 
 
-def load_model(model_path: str, use_fp16: bool = False):
+def validate_encoder_options(encoder_device, precision, faiss_gpu=False):
+    """Explicit configuration only: no automatic device or precision selection."""
+    if encoder_device not in ("cpu", "cuda"):
+        raise ValueError("encoder_device must be cpu or cuda")
+    if precision not in ("fp32", "fp16"):
+        raise ValueError("precision must be fp32 or fp16")
+    if encoder_device == "cpu" and precision != "fp32":
+        raise ValueError("CPU encoder requires explicit fp32 precision")
+    if encoder_device == "cpu" and faiss_gpu:
+        raise ValueError("CPU retrieval cannot enable --faiss_gpu")
+
+
+def load_model(model_path: str, use_fp16: bool = False, encoder_device: str = "cuda", precision=None):
+    # Preserve legacy callers' use_fp16 value; the new precision option is explicit.
+    if precision is None:
+        precision = "fp16" if use_fp16 else "fp32"
+    validate_encoder_options(encoder_device, precision)
+    dtype = torch.float16 if precision == "fp16" else torch.float32
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
-    model.cuda()
-    if use_fp16:
-        model = model.half()
+    model = model.to(device=torch.device(encoder_device), dtype=dtype)
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
     return model, tokenizer
 
@@ -64,14 +79,19 @@ def pooling(pooler_output, last_hidden_state, attention_mask=None, pooling_metho
 
 
 class Encoder:
-    def __init__(self, model_name, model_path, pooling_method, max_length, use_fp16):
+    def __init__(self, model_name, model_path, pooling_method, max_length, use_fp16, encoder_device="cuda", precision=None):
         self.model_name = model_name
         self.model_path = model_path
         self.pooling_method = pooling_method
         self.max_length = max_length
-        self.use_fp16 = use_fp16
+        self.precision = precision if precision is not None else ("fp16" if use_fp16 else "fp32")
+        validate_encoder_options(encoder_device, self.precision)
+        self.encoder_device = encoder_device
+        self.device = torch.device(encoder_device)
+        self.use_fp16 = self.precision == "fp16"
 
-        self.model, self.tokenizer = load_model(model_path=model_path, use_fp16=use_fp16)
+        self.model, self.tokenizer = load_model(model_path=model_path, use_fp16=self.use_fp16,
+                                                encoder_device=encoder_device, precision=self.precision)
         self.model.eval()
 
     @torch.no_grad()
@@ -95,7 +115,7 @@ class Encoder:
         inputs = self.tokenizer(
             query_list, max_length=self.max_length, padding=True, truncation=True, return_tensors="pt"
         )
-        inputs = {k: v.cuda() for k, v in inputs.items()}
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         if "T5" in type(self.model).__name__:
             # T5-based retrieval model
@@ -116,7 +136,8 @@ class Encoder:
         query_emb = query_emb.astype(np.float32, order="C")
 
         del inputs, output
-        torch.cuda.empty_cache()
+        if self.encoder_device == "cuda":
+            torch.cuda.empty_cache()
 
         return query_emb
 
@@ -220,6 +241,8 @@ class DenseRetriever(BaseRetriever):
             pooling_method=config.retrieval_pooling_method,
             max_length=config.retrieval_query_max_length,
             use_fp16=config.retrieval_use_fp16,
+            encoder_device=config.encoder_device,
+            precision=config.precision,
         )
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
@@ -262,7 +285,8 @@ class DenseRetriever(BaseRetriever):
             scores.extend(batch_scores)
 
             del batch_emb, batch_scores, batch_idxs, query_batch, flat_idxs, batch_results
-            torch.cuda.empty_cache()
+            if self.encoder.encoder_device == "cuda":
+                torch.cuda.empty_cache()
 
         if return_score:
             return results, scores
@@ -302,7 +326,12 @@ class Config:
         retrieval_query_max_length: int = 256,
         retrieval_use_fp16: bool = True,
         retrieval_batch_size: int = 512,
+        encoder_device: str = "cuda",
+        precision=None,
     ):
+        self.encoder_device = encoder_device
+        self.precision = precision if precision is not None else ("fp16" if retrieval_use_fp16 else "fp32")
+        validate_encoder_options(encoder_device, self.precision, faiss_gpu)
         self.retrieval_method = retrieval_method
         self.retrieval_topk = retrieval_topk
         self.index_path = index_path
@@ -313,7 +342,7 @@ class Config:
         self.retrieval_model_path = retrieval_model_path
         self.retrieval_pooling_method = retrieval_pooling_method
         self.retrieval_query_max_length = retrieval_query_max_length
-        self.retrieval_use_fp16 = retrieval_use_fp16
+        self.retrieval_use_fp16 = self.precision == "fp16"
         self.retrieval_batch_size = retrieval_batch_size
 
 
@@ -373,7 +402,7 @@ def retrieve_endpoint(request: QueryRequest):
     return {"result": resp}
 
 
-if __name__ == "__main__":
+def build_parser():
     parser = argparse.ArgumentParser(description="Launch the local faiss retriever.")
     parser.add_argument(
         "--index_path", type=str, default="/home/peterjin/mnt/index/wiki-18/e5_Flat.index", help="Corpus indexing file."
@@ -394,7 +423,13 @@ if __name__ == "__main__":
     parser.add_argument("--faiss_gpu", action="store_true", help="Use GPU for computation")
     parser.add_argument("--port", type=int, default=8000, help="Port to run the server on")  # NEW
 
-    args = parser.parse_args()
+    parser.add_argument("--encoder_device", choices=["cpu", "cuda"], default="cuda")
+    parser.add_argument("--precision", choices=["fp32", "fp16"], default="fp16")
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
 
     # 1) Build a config (could also parse from arguments).
     #    In real usage, you'd parse your CLI arguments or environment variables.
@@ -407,8 +442,10 @@ if __name__ == "__main__":
         retrieval_model_path=args.retriever_model,
         retrieval_pooling_method=args.retrieval_pooling_method,
         retrieval_query_max_length=256,
-        retrieval_use_fp16=True,
+        retrieval_use_fp16=args.precision == "fp16",
         retrieval_batch_size=512,
+        encoder_device=args.encoder_device,
+        precision=args.precision,
     )
 
     # 2) Instantiate a global retriever so it is loaded once and reused.

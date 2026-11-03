@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root=${MEDTIV_ROOT:-/data/fby/med-tiv}
-mode=${1:?retriever, tool, verifier, or generator required}
+mode=${1:?retriever, retriever-cpu, tool, verifier, or generator required}
 model=${2:-$root/models/Qwen2.5-7B-Instruct}
 cd "$root/code"
 export PYTHONPATH="$PWD:$PWD/verl${PYTHONPATH:+:$PYTHONPATH}"
@@ -9,13 +9,23 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export no_proxy="localhost,127.0.0.1,0.0.0.0"
 source "$root/env/bin/activate"
 case "$mode" in
-  retriever)
-    export CUDA_VISIBLE_DEVICES=4
-    exec "$root/retriever-env/bin/python" -u verl_tool/servers/tools/utils/retrieval_server.py \
+  retriever|retriever-cpu)
+    export HF_HOME="$root/cache/huggingface" HF_DATASETS_CACHE="$root/cache/datasets"
+    export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8
+    if [[ "$mode" == retriever-cpu ]]; then
+      export CUDA_VISIBLE_DEVICES=''
+      python_bin="$root/env/bin/python"
+      device_args=(--encoder_device cpu --precision fp32)
+    else
+      export CUDA_VISIBLE_DEVICES=4
+      python_bin="$root/retriever-env/bin/python"
+      device_args=(--encoder_device cuda --precision fp16 --faiss_gpu)
+    fi
+    exec "$python_bin" -u verl_tool/servers/tools/utils/retrieval_server.py \
       --index_path "$root/data/retriever_index/medcpt_Flat.index" \
       --corpus_path "$root/data/retriever_index/medical_combined.jsonl" \
       --retriever_name medcpt --retriever_model "$root/models/MedCPT-Query-Encoder" \
-      --retrieval_pooling_method cls --topk 3 --faiss_gpu --host 127.0.0.1 --port 18501
+      --retrieval_pooling_method cls --topk 3 "${device_args[@]}" --host 127.0.0.1 --port 18501
     ;;
   tool)
     export CUDA_VISIBLE_DEVICES=''
