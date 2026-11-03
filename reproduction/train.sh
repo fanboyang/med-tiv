@@ -10,6 +10,7 @@ source "$root/env/bin/activate"
 cd "$root/code"
 export PYTHONPATH="$PWD:$PWD/verl${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export NCCL_DEBUG=WARN VLLM_USE_V1=1 WANDB_MODE=disabled
 export no_proxy="localhost,127.0.0.1,0.0.0.0,$(hostname -i)"
 export RAY_TMPDIR="$root/tmp/ray"
