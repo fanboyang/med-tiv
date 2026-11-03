@@ -48,7 +48,8 @@ class CurriculumTests(unittest.TestCase):
     def test_partial_transport_resume_reuses_completed_requests(self):
         tokenizer=FakeTokenizer()
         row={'id':'real-id','label':1,'messages':[{'role':'user','content':'q'}]}
-        raw={'choices':[{'text':'<think>x</think><answer>1</answer>'}]}
+        raw={'choices':[{'text':'<think>x</think><answer>1</answer>',
+                         'generated_text':'<think>x</think><answer>1</answer>', 'response_token_count':33}]}
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'requests.jsonl'
             journal=Journal(path,{})
@@ -60,11 +61,21 @@ class CurriculumTests(unittest.TestCase):
                 self.assertEqual(request.call_count,7)
                 self.assertEqual(result['rewards'],[1.0]*8)
 
+    def test_truncated_observation_does_not_pollute_model_only_reward(self):
+        row={'id':'real-id','label':1,'messages':[{'role':'user','content':'q'}]}
+        text='<think>x</think><answer>1</answer>'
+        raw={'choices':[{'text':text+'<answer>0</answer></information>', 'generated_text':text,'response_token_count':64}]}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch('reproduction.evaluate.post',return_value=raw):
+                result=sample_group(row,0,FakeTokenizer(),Journal(Path(directory)/'requests.jsonl',{}),
+                                    'model','local',42,1024,8192,16384,8192)
+            self.assertEqual(result['rewards'],[1.0]*8)
+
     def test_malformed_response_is_terminal_and_not_resampled(self):
         row={'id':'real-id','label':1,'messages':[{'role':'user','content':'q'}]}
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'requests.jsonl'
-            with patch('reproduction.evaluate.post',return_value={'choices':[]}):
+            with patch('reproduction.evaluate.post',return_value={'choices':[{'text':'<answer>1</answer>'}]}):
                 with self.assertRaises(RuntimeError):sample_group(row,0,FakeTokenizer(),Journal(path,{}),'model','local',42,1024,8192,16384,8192)
             with patch('reproduction.evaluate.post') as request:
                 with self.assertRaises(RuntimeError):sample_group(row,0,FakeTokenizer(),Journal(path,{}),'model','local',42,1024,8192,16384,8192)

@@ -39,6 +39,14 @@ def parse_answer(text, allowed):
     return matches[0] if matches[0] in allowed else None
 
 
+def model_generated_text(raw):
+    """Require the service's model-only field; full text may contain truncated tools."""
+    text = raw['choices'][0]['generated_text']
+    if not isinstance(text, str):
+        raise ValueError('service generated_text must be a string')
+    return text
+
+
 def parse_verdict(text):
     text = strip_observations(text)
     matches = re.findall(r'<answer>(.*?)</answer>', text, re.DOTALL)
@@ -177,7 +185,10 @@ def run(args):
                 raise ValueError('gold is not an option key')
         inputs[name] = rows
     config = {k:v for k,v in vars(args).items() if k not in ['workers','timeout','output_dir']}
-    config['protocol_version'] = 2
+    config['protocol_version'] = 4
+    config['verifier_server_response_budget'] = 8192
+    config['verifier_server_budget_source'] = 'original model IDs + retained observation IDs'
+    config['verifier_text_source'] = 'choices[0].generated_text'
     config['missing_policy'] = 'any_missing_candidate_makes_question_missing'
     config['input_rows'] = inputs  # Exact resume identity, no data hash.
     journal = Journal(output/'requests.jsonl',config)
@@ -206,7 +217,7 @@ def run(args):
                            'temperature':args.verifier_temperature,'top_p':args.verifier_top_p,'max_tokens':args.verifier_max_tokens,
                            'seed':sample_seed}
             verdict = journal.call(key+['verify'],args.verifier_url.rstrip('/')+'/completions',
-                                   verify_body,lambda raw:parse_verdict(raw['choices'][0]['text']),args.timeout)
+                                   verify_body,lambda raw:parse_verdict(model_generated_text(raw)),args.timeout)
             results.append((generated['answer'],verdict))
         prediction,rejected_all = hard_vote(results)
         return {'dataset':name,'id':str(row['id']),'seed':seed,'prediction':prediction,

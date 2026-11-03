@@ -302,7 +302,7 @@ class ModelService:
         sampling_params = sampling_params.copy()
         
         async with self.encode_lock:
-            prompt_lens = [len(self.tokenizer.encode(prompt)) for prompt in prompts]
+            prompt_lens = [len(prompt) if isinstance(prompt,list) else len(self.tokenizer.encode(prompt,add_special_tokens=False)) for prompt in prompts]
             max_prompt_tokens = max(prompt_lens)
         
         sampling_params['max_tokens'] = min(
@@ -313,7 +313,7 @@ class ModelService:
         # Extract seed if present (not a standard OpenAI completions param, pass via extra_body)
         seed = sampling_params.pop('seed', None)
         
-        extra_body = {}
+        extra_body = {'return_token_ids': True}
         if seed is not None:
             extra_body['seed'] = seed
         
@@ -330,82 +330,81 @@ class ModelService:
         )
         return response
     
-    async def generate_with_tools(self, prompts: List[str], sampling_params: dict) -> Tuple[List[str], List[str], List[Optional[Dict]]]:
+    async def generate_with_tools(self, prompts: List[str], sampling_params: dict):
+        """Keep original generated IDs and total response budgets per trajectory.
+
+        Full traces include retained observations; generated_text contains only
+        retained model IDs. Prompts run independently so a long prompt cannot
+        reduce another prompt's generation budget.
         """
-        Generate text with tool calls in a multi-turn loop.
-        
-        Args:
-            prompts: Initial prompts for generation
-            sampling_params: Sampling parameters for the model
-            
-        Returns:
-            Tuple of (full_responses, finish_reasons, final_logprobs)
-        """
+        full_responses, finish_reasons, logprobs, model_texts, counts = [], [], [], [], []
+        for prompt in prompts:
+            result = await self._generate_one_with_tools(prompt, sampling_params)
+            full, reason, logs, model_text, count = result
+            full_responses.append(full)
+            finish_reasons.append(reason)
+            logprobs.append(logs)
+            model_texts.append(model_text)
+            counts.append(count)
+        return full_responses, finish_reasons, logprobs, model_texts, counts
+
+    async def _generate_one_with_tools(self, prompt: str, sampling_params: dict):
+        if sampling_params.get('n',1) != 1:
+            raise ValueError('tool generation requires n=1 per trajectory')
         client = random.choice(self.clients)
-        assert sampling_params.get("n", 1) <= 1, "n > 1 is not supported yet for tool generation"
-        
-        contexts = list(prompts)  # Make a copy
-        final_responses = ["" for _ in range(len(prompts))]
-        final_logprobs: List[Optional[Dict]] = [None for _ in range(len(prompts))]
-        traj_ids = [str(uuid.uuid4()) for _ in range(len(prompts))]
-        active_masks = [True for _ in range(len(prompts))]
-        finish_reasons = [None for _ in range(len(prompts))]
-        model = self.model_config.model
-        
-        for action_step in range(self.tool_config.max_turns + 1):
-            if action_step == self.tool_config.max_turns:
-                # Last turn: remove only tool-trigger stop tokens so we still stop at </answer>
-                if "stop" in sampling_params and sampling_params["stop"] is not None:
-                    sampling_params = sampling_params.copy()  # Don't mutate original
-                    tool_trigger_stop_tokens = ["</search>"]
-                    for tok in tool_trigger_stop_tokens:
-                        if tok in sampling_params["stop"]:
-                            sampling_params["stop"].remove(tok)
-                
-            active_traj_ids = [traj_ids[i] for i in range(len(traj_ids)) if active_masks[i]]
-            active_contexts = [contexts[i] for i in range(len(contexts)) if active_masks[i]]
-            
-            if len(active_contexts) == 0:
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        running_ids = list(prompt_ids)
+        response_ids, model_ids = [], []
+        final_logprobs = None
+        reason = 'length'
+        trajectory_id = str(uuid.uuid4())
+        response_budget = self.tool_config.max_response_length
+        context_budget = self.model_config.max_model_len
+        action_budget = sampling_params['max_tokens']
+        if response_budget < 1 or action_budget < 1 or len(prompt_ids) >= context_budget:
+            raise ValueError('invalid response/action budget or prompt exhausts model context')
+        for step in range(self.tool_config.max_turns + 1):
+            remaining = min(response_budget-len(response_ids), context_budget-len(running_ids))
+            if remaining <= 0:
+                reason = 'length'
                 break
-            
-            # Send request
-            outputs = await self.send_request(client, active_contexts, model, sampling_params)
-            active_responses, finishes, active_finish_reasons, active_logprobs = await self._postprocess_responses(outputs, action_step)
-            
-            # Call tool server
-            tool_responses = await self.call_tool_server_async(
-                active_traj_ids,
-                active_responses,
-                finishes
-            )
-                
-            observations = await self.post_process_observations(
-                tool_responses["observations"], 
-                tool_responses["dones"], 
-                tool_responses["valids"], 
-                finishes
-            )
-            dones = tool_responses["dones"]
-            
-            # Update state for each trajectory
-            active_idx = 0
-            for i in range(len(contexts)):
-                if active_masks[i]:
-                    contexts[i] += active_responses[active_idx] + observations[active_idx]
-                    final_responses[i] += active_responses[active_idx] + observations[active_idx]
-                    finish_reasons[i] = active_finish_reasons[active_idx]
-                    
-                    # Accumulate logprobs across turns
-                    if active_logprobs[active_idx] is not None:
-                        if final_logprobs[i] is None:
-                            final_logprobs[i] = {"content": []}
-                        final_logprobs[i]["content"].extend(active_logprobs[active_idx]["content"])
-                    
-                    active_masks[i] = not dones[active_idx]
-                    active_idx += 1
-            
-        return final_responses, finish_reasons, final_logprobs
-    
+            params = sampling_params.copy()
+            params['stop'] = list(sampling_params.get('stop',[]))
+            params['max_tokens'] = min(action_budget,remaining)
+            if step == self.tool_config.max_turns:
+                params['stop'] = [stop for stop in params['stop'] if stop != '</search>']
+            # Original prompt IDs are passed back, without a decode/re-encode cycle.
+            outputs = await self.send_request(client,[list(running_ids)],self.model_config.model,params)
+            active_responses, finishes, reasons, turn_logprobs = await self._postprocess_responses(outputs,step)
+            if len(outputs.choices) != 1:
+                raise ValueError('expected exactly one completion per trajectory')
+            generated_ids = getattr(outputs.choices[0],'token_ids',None)
+            if not isinstance(generated_ids,list) or any(type(token) is not int for token in generated_ids):
+                raise ValueError('vLLM return_token_ids is required for exact response budgets')
+            if len(generated_ids) > params['max_tokens']:
+                raise ValueError('vLLM exceeded the requested action token budget')
+            running_ids.extend(generated_ids)
+            response_ids.extend(generated_ids)
+            model_ids.extend(generated_ids)
+            reason = reasons[0]
+            if turn_logprobs[0] is not None:
+                if final_logprobs is None:
+                    final_logprobs = {'content':[]}
+                final_logprobs['content'].extend(turn_logprobs[0]['content'])
+            # Tool interaction is unchanged. Only retained observation IDs are capped.
+            tools = await self.call_tool_server_async([trajectory_id],active_responses,finishes)
+            observations = await self.post_process_observations(tools['observations'],tools['dones'],tools['valids'],finishes)
+            observation_ids = self.tokenizer.encode(observations[0],add_special_tokens=False)
+            available = max(0,min(response_budget-len(response_ids),context_budget-len(running_ids)))
+            observation_ids = observation_ids[:available]
+            response_ids.extend(observation_ids)
+            running_ids.extend(observation_ids)
+            if tools['dones'][0]:
+                break
+        # Model-only decoding never includes tool IDs, even if observation tags were truncated.
+        return (self.tokenizer.decode(response_ids,skip_special_tokens=False),reason,final_logprobs,
+                self.tokenizer.decode(model_ids,skip_special_tokens=True),len(response_ids))
+
     async def chat_completions_async(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Process API request and generate response"""
         if "messages" not in body or not body["messages"]:
@@ -445,11 +444,11 @@ class ModelService:
         elif body.get("logprobs"):
             sampling_params["logprobs"] = 10  # Default number of top logprobs
 
-        all_responses, finish_reasons, all_logprobs = await self.generate_with_tools(prompts, sampling_params)
+        all_responses, finish_reasons, all_logprobs, generated_texts, response_token_counts = await self.generate_with_tools(prompts, sampling_params)
         
         async with self.encode_lock:
-            prompt_tokens = len(self.tokenizer.encode(prompt))
-            completion_tokens = sum(len(self.tokenizer.encode(r)) for r in all_responses)
+            prompt_tokens = len(self.tokenizer.encode(prompt,add_special_tokens=False))
+            completion_tokens = sum(response_token_counts)
             total_tokens = prompt_tokens + completion_tokens
         
         # Build response
@@ -457,6 +456,8 @@ class ModelService:
         for i in range(len(all_responses)):
             choice = {
                 "index": i,
+                "generated_text": generated_texts[i],
+                "response_token_count": response_token_counts[i],
                 "message": {
                     "role": "assistant",
                     "content": all_responses[i],
@@ -515,11 +516,11 @@ class ModelService:
         elif body.get("logprobs"):
             sampling_params["logprobs"] = 5
 
-        all_responses, finish_reasons, all_logprobs = await self.generate_with_tools(prompts, sampling_params)
+        all_responses, finish_reasons, all_logprobs, generated_texts, response_token_counts = await self.generate_with_tools(prompts, sampling_params)
         
         async with self.encode_lock:
-            prompt_tokens = len(self.tokenizer.encode(prompt))
-            completion_tokens = sum(len(self.tokenizer.encode(r)) for r in all_responses)
+            prompt_tokens = len(self.tokenizer.encode(prompt,add_special_tokens=False))
+            completion_tokens = sum(response_token_counts)
             total_tokens = prompt_tokens + completion_tokens
         
         # Build response
@@ -527,6 +528,8 @@ class ModelService:
         for i in range(len(all_responses)):
             choice = {
                 "index": i,
+                "generated_text": generated_texts[i],
+                "response_token_count": response_token_counts[i],
                 "text": all_responses[i],
                 "finish_reason": finish_reasons[i]
             }

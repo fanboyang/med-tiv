@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
-from reproduction.evaluate import generator_messages, parse_answer, parse_verdict, hard_vote, summarize, Journal, ResponseDecodeError
+from reproduction.evaluate import generator_messages, parse_answer, parse_verdict, hard_vote, summarize, Journal, ResponseDecodeError, model_generated_text
 
 class EvaluationTests(unittest.TestCase):
     def test_gold_is_not_in_prompt(self):
@@ -32,6 +32,13 @@ class EvaluationTests(unittest.TestCase):
             with patch('reproduction.evaluate.post') as request:
                 self.assertIsNone(Journal(path,{}).call(['bad'],'local',{},lambda x:0,1))
                 request.assert_not_called()
+
+    def test_model_only_response_field_is_required(self):
+        raw={'choices':[{'text':'<answer>0</answer></information>',
+                         'generated_text':'<think>x</think><answer>1</answer>'}]}
+        self.assertEqual(parse_verdict(model_generated_text(raw)),1)
+        with self.assertRaises(KeyError):model_generated_text({'choices':[{'text':'<answer>0</answer>'}]})
+        with self.assertRaises(ValueError):model_generated_text({'choices':[{'generated_text':None}]})
 
     def test_author_vote_and_ties(self):
         self.assertEqual(hard_vote([('B',0),('A',0)]), ('B',True))

@@ -68,13 +68,17 @@ def hf_local_files(source, num_proc=8, offline=False):
         raise ValueError('num_proc 必须为正数')
     specification = SOURCES[source]
     endpoint = os.environ.get('HF_ENDPOINT', ENDPOINT)
-    info = HfApi(endpoint=endpoint).dataset_info(specification['dataset'], revision=specification['revision'])
+    info = HfApi(endpoint=endpoint).dataset_info(
+        specification['dataset'], revision=specification['revision'], files_metadata=True)
     names = [item.rfilename for item in info.siblings if item.rfilename.startswith('chunk/')]
     expected = EXPECTED_CHUNKS[source]
     if (info.sha != specification['revision'] or len(names) != len(expected)
             or set(names) != set(expected)):
         raise ValueError(f'{source}: 固定revision完整文件清单不符；'
                          f'expected={len(expected)}, actual={len(names)}, revision={info.sha}')
+    sizes = {item.rfilename: item.size for item in info.siblings if item.rfilename in expected}
+    if any(type(size) is not int or size < 0 for size in sizes.values()):
+        raise ValueError(f'{source}: 官方分片size元数据缺失或无效')
 
     def obtain(filename):
         # 不传cache_dir：Hub缓存沿用当前HF_HOME，与已有54GB缓存相同。
@@ -86,8 +90,12 @@ def hf_local_files(source, num_proc=8, offline=False):
             path = hf_hub_download(repo_id=specification['dataset'], filename=filename,
                                    revision=specification['revision'], repo_type='dataset',
                                    endpoint=endpoint, local_files_only=offline)
-        if not Path(path).is_file() or Path(path).stat().st_size <= 0:
-            raise ValueError(f'{source}: 分片未完整落盘 {filename}')
+        if not Path(path).is_file():
+            raise ValueError(f'{source}: 分片未落盘 {filename}')
+        actual_size = Path(path).stat().st_size
+        if actual_size != sizes[filename]:
+            raise ValueError(f'{source}: 分片size不符 {filename}: '
+                             f'local={actual_size}, official={sizes[filename]}')
         return str(path)
 
     executor = ThreadPoolExecutor(max_workers=num_proc)
@@ -111,9 +119,16 @@ def load_hf_source(source, cache_dir=None, num_proc=8, offline=False):
         os.environ['HF_HUB_OFFLINE'] = '1'
     paths = hf_local_files(source, num_proc=num_proc, offline=offline)
     from datasets import load_dataset
+    # 保留所有经官方size校验的路径（包括合法空片）。HF JSON builder每个worker
+    # 的首文件必须非空，故空片排末尾，并让每组至少可容纳全部空片再加一非空片。
+    paths = sorted(paths, key=lambda path: Path(path).stat().st_size == 0)
+    empty_count = sum(Path(path).stat().st_size == 0 for path in paths)
+    if empty_count == len(paths):
+        raise ValueError(f'{source}: 全部官方分片为空，无法生成有效语料')
+    json_workers = min(num_proc, len(paths) // (empty_count + 1))
     # 只给JSON builder显式本地路径，彻底避免HF仓库树枚举和分页Link。
     return load_dataset('json', data_files={'train': paths}, split='train',
-                        cache_dir=cache_dir, num_proc=num_proc)
+                        cache_dir=cache_dir, num_proc=json_workers)
 
 
 def quarantine(path):

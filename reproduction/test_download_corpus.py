@@ -23,7 +23,7 @@ class DownloadCorpusTests(unittest.TestCase):
         m = module()
         revision = m.SOURCES['pubmed']['revision']
         filenames = [f'chunk/pubmed23n{i:04d}.jsonl' for i in range(1, 1167)]
-        metadata = SimpleNamespace(sha=revision, siblings=[SimpleNamespace(rfilename=f) for f in filenames])
+        metadata = SimpleNamespace(sha=revision, siblings=[SimpleNamespace(rfilename=f, size=3) for f in filenames])
         with tempfile.TemporaryDirectory() as temp:
             cached = Path(temp)/'cached.jsonl'
             cached.write_text('{}\n')
@@ -35,7 +35,7 @@ class DownloadCorpusTests(unittest.TestCase):
                 paths = m.hf_local_files('pubmed', num_proc=2)
                 self.assertEqual(len(paths), 1166)
                 api.assert_called_once_with(endpoint='https://hf-mirror.com')
-                api.return_value.dataset_info.assert_called_once_with('MedRAG/pubmed', revision=revision)
+                api.return_value.dataset_info.assert_called_once_with('MedRAG/pubmed', revision=revision, files_metadata=True)
                 self.assertEqual(lookup.call_count, 1166)
                 self.assertEqual(lookup.call_args.kwargs['revision'], revision)
                 download.assert_not_called()
@@ -65,14 +65,63 @@ class DownloadCorpusTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     m.hf_local_files('pubmed', num_proc=1)
 
+    def test_official_zero_byte_shard_is_not_treated_as_corruption(self):
+        m = module()
+        revision = m.SOURCES['pubmed']['revision']
+        names = [f'chunk/pubmed23n{i:04d}.jsonl' for i in range(1, 1167)]
+        empty_name = 'chunk/pubmed23n0654.jsonl'
+        siblings = [SimpleNamespace(rfilename=f, size=0 if f == empty_name else 3) for f in names]
+        with tempfile.TemporaryDirectory() as temp:
+            valid, empty = Path(temp)/'valid.jsonl', Path(temp)/'empty.jsonl'
+            valid.write_text('{}\n')
+            empty.write_text('')
+            with patch('huggingface_hub.HfApi') as api, \
+                 patch('huggingface_hub.try_to_load_from_cache') as lookup:
+                api.return_value.dataset_info.return_value = SimpleNamespace(sha=revision, siblings=siblings)
+                lookup.side_effect = lambda *a, **kw: str(empty if kw['filename'] == empty_name else valid)
+                paths = m.hf_local_files('pubmed', num_proc=2)
+                self.assertEqual(len(paths), 1166)
+                self.assertIn(str(empty), paths)
+                siblings[653].size = 1
+                with self.assertRaisesRegex(ValueError, 'size'):
+                    m.hf_local_files('pubmed', num_proc=2)
+
     def test_dataset_loader_uses_only_explicit_local_json_paths(self):
         m = module()
-        with patch.object(m, 'hf_local_files', return_value=['/local/shard.jsonl']) as files, \
-             patch('datasets.load_dataset', return_value='dataset') as load:
-            self.assertEqual(m.load_hf_source('pubmed', cache_dir='/dataset-cache', num_proc=2), 'dataset')
-            self.assertEqual(load.call_args.args, ('json',))
-            self.assertEqual(load.call_args.kwargs['data_files'], {'train': ['/local/shard.jsonl']})
-            self.assertNotIn('revision', load.call_args.kwargs)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'shard.jsonl'
+            path.write_text('{}\n')
+            with patch.object(m, 'hf_local_files', return_value=[str(path)]), \
+                 patch('datasets.load_dataset', return_value='dataset') as load:
+                self.assertEqual(m.load_hf_source('pubmed', cache_dir='/dataset-cache', num_proc=2), 'dataset')
+                self.assertEqual(load.call_args.args, ('json',))
+                self.assertEqual(load.call_args.kwargs['data_files'], {'train': [str(path)]})
+                self.assertNotIn('revision', load.call_args.kwargs)
+
+    def test_json_builder_preserves_legal_empty_file_without_fake_records(self):
+        m = module()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            empty, valid = root/'empty.jsonl', root/'valid.jsonl'
+            empty.write_text('')
+            valid.write_text('{"id":"x","title":"title","content":"body"}\n')
+            # HF JSON builder不能以空文件推断schema；保留两条路径，调整顺序/worker分组。
+            with patch.object(m, 'hf_local_files', return_value=[str(empty), str(valid)]):
+                dataset = m.load_hf_source('pubmed', cache_dir=str(root/'cache'), num_proc=2)
+            self.assertEqual(len(dataset), 1)
+            self.assertEqual(dataset[0]['id'], 'x')
+            self.assertEqual(dataset[0]['content'], 'body')
+            # 8 workers的边界：16片含1空片，每个分组至少2片，首片均非空。
+            valid_paths = []
+            for i in range(15):
+                shard = root/f'valid-{i}.jsonl'
+                shard.write_text('{"id":"x","content":"body"}\n')
+                valid_paths.append(str(shard))
+            with patch.object(m, 'hf_local_files', return_value=[str(empty)]+valid_paths), \
+                 patch('datasets.load_dataset', return_value='dataset') as load:
+                m.load_hf_source('pubmed', cache_dir=str(root/'cache'), num_proc=8)
+                self.assertEqual(load.call_args.kwargs['num_proc'], 8)
+                self.assertEqual(load.call_args.kwargs['data_files']['train'], valid_paths+[str(empty)])
 
     def test_text_and_title_follow_author_format(self):
         m = module()

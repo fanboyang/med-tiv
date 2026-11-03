@@ -18,6 +18,7 @@ class ToolConfig:
     max_turns: int = 5  # max generation turns
     truncate_obs_side: str = "left"  # "left" or "right", which side to truncate when the observation is too long
     action_stop_tokens: str = None
+    max_response_length: int = 8192  # total model + observation tokens, matching training
     max_obs_length: int = 512  # maximum length of observation
     enable_mtrl: bool=False
     mtrl_sep: str=None # "\n<|im_start|>system\n{obs}<|im_end|>\n<|im_start|>assistant\n"

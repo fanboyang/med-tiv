@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import random
-from reproduction.evaluate import Journal
+from reproduction.evaluate import Journal, model_generated_text
 from reproduction.reward import compute_score
 
 
@@ -78,16 +78,19 @@ def sample_group(row,index,tokenizer,journal,model,api_url,seed,max_tokens,
         body={'model':model,'prompt':prompt,'n':1,'temperature':1.0,'top_p':0.95,
               'max_tokens':max_tokens,'seed':seed+index*8+k}
         def extract(raw):
-            text=raw['choices'][0]['text']
-            if not isinstance(text,str):
+            full_text=raw['choices'][0]['text']
+            text=model_generated_text(raw)
+            if not isinstance(full_text,str):
                 raise ValueError('service response text must be a string')
             # Matches training's total response cap, including tool observations.
-            response_tokens=len(tokenizer.encode(text,add_special_tokens=False))
+            response_tokens=raw['choices'][0]['response_token_count']
+            if type(response_tokens) is not int or response_tokens < 0:
+                raise ValueError('service response_token_count must be a nonnegative integer')
             if response_tokens > max_response_tokens:
                 raise ValueError('service response exceeds training response budget')
             if len(tokenizer.encode(prompt,add_special_tokens=False))+response_tokens > max_model_len:
                 raise ValueError('service response exceeds model context budget')
-            return {'text':text,'reward':compute_score(text,str(row['label'])),
+            return {'text':full_text,'generated_text':text,'reward':compute_score(text,str(row['label'])),
                     'response_tokens':response_tokens}
         value=journal.call([row['id'],k],api_url.rstrip('/')+'/completions',body,extract,900)
         if value is None:
@@ -125,7 +128,9 @@ def main():
     output=Path(args.output_dir)
     output.mkdir(parents=True,exist_ok=True)
     config={k:v for k,v in vars(args).items() if k not in ('workers','output_dir')}
-    config['protocol_version']=2
+    config['protocol_version']=4
+    config['response_budget_source']='service original model IDs + retained observation IDs'
+    config['reward_text_source']='choices[0].generated_text'
     config['pool_rows']=pool  # Exact input identity, no hashes; reordering also fails.
     config_path=output/'config.json'
     if config_path.exists() and json.loads(config_path.read_text()) != config:
