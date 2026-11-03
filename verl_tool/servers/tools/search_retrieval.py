@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 def setup_debug_logger():
     """Setup a separate file handler for detailed debug logging"""
-    debug_log_dir = '/ocean/projects/med230010p/hzhang38/labsage/verl-tool/examples/train/search_r1'
+    debug_log_dir = os.environ.get('MEDTIV_TOOL_LOG_DIR', '/data/fby/med-tiv/logs/tools')
     os.makedirs(debug_log_dir, exist_ok=True)
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')

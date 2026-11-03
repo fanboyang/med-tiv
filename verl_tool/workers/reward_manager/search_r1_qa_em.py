@@ -1,122 +1,12 @@
-"""
-Search-R1 style QA Exact Match Reward Manager
-"""
+"""Search-R1 QA manager wired to the Med-TIV paper reward."""
 import torch
-import random
-import regex as re
-import json
-import time
-import os
-import time
-import os
 import numpy as np
-from typing import Dict, Any
 from verl import DataProto
 from verl.workers.reward_manager.registry import register
-from .reward_score import _default_compute_score
 from collections import defaultdict
-from pathlib import Path
+from reproduction.reward import compute_score as paper_compute_score, decode_generated_response
 
-def normalize_answer(s):
-    """Lower text and remove punctuation, articles and extra whitespace."""
-    import string
-    
-    def remove_articles(text):
-        return re.sub(r'\b(a|an|the)\b', ' ', text)
-
-    def white_space_fix(text):
-        return ' '.join(text.split())
-
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return ''.join(ch for ch in text if ch not in exclude)
-
-    def lower(text):
-        return text.lower()
-
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
-
-
-def em_check(prediction, golden_answers):
-    if isinstance(golden_answers, str):
-        golden_answers = [golden_answers]
-    normalized_prediction = normalize_answer(prediction)
-    score = 0
-    for golden_answer in golden_answers:
-        golden_answer = normalize_answer(golden_answer)
-        if golden_answer == normalized_prediction:
-            score = 1
-            break
-    return score
-    
-
-def extract_solution(solution_str: str) -> str:
-    """Extract the final answer from <answer> tags in the solution string."""
-    answer_pattern = r"<answer>(.*?)</answer>"
-    match = re.finditer(answer_pattern, solution_str, re.DOTALL)
-    matches = list(match)
-
-    # If there are 0  matches, return None
-    if len(matches) < 1:
-        return None
-
-    # If there are 2 or more matches, return the last one
-    return matches[-1].group(1).strip()
-
-
-def count_answer_tags(text):
-    opening_tags = text.count("<answer>")
-    closing_tags = text.count("</answer>")
-    return opening_tags, closing_tags
-
-
-def count_repetition_patterns(text):
-    """Count problematic repetition patterns that indicate looping."""
-    patterns = [
-        r"Upon re-(?:checking|examining|verifying)",
-        r"I (?:should recall|found that|realized)",
-        r"However, I should",
-    ]
-    total_count = 0
-    for pattern in patterns:
-        total_count += len(re.findall(pattern, text, re.IGNORECASE))
-    return total_count
-
-
-def compute_score(solution_str, ground_truth, method="strict", format_score=0.1, score=1.0):
-    """
-    Scoring function with format penalties.
-    
-    Reward structure:
-    - Correct answer with proper format: +1.0
-    - Correct answer with excessive tags: +0.25
-    - Wrong answer with proper format: +0.1 (format_score)
-    - Missing </answer> tag: -0.5 (PENALTY)
-    - Excessive repetition loops: additional -0.1 per 5 loops
-    """
-    answer = extract_solution(solution_str=solution_str)
-    open_count, close_count = count_answer_tags(solution_str)
-    repetition_count = count_repetition_patterns(solution_str)
-    
-
-    # Missing </answer> tag - apply penalty
-    if answer is None:
-        base_penalty = -0.5
-        loop_penalty = -0.1 * (repetition_count // 5)  # -0.1 per 5 loops
-        return max(base_penalty + loop_penalty, -1.5)  # Cap at -1.5
-    
-    # Has </answer> tag
-    repetition_penalty = -0.05 * (repetition_count // 10)  # Small penalty for loops even with answer
-    
-    target_answers = ground_truth.get('target', ground_truth) if isinstance(ground_truth, dict) else ground_truth
-    
-    if em_check(answer, target_answers):
-        if open_count > 10 or close_count > 10:
-            return score / 4 + repetition_penalty
-        return score + repetition_penalty
-    else:
-        return format_score + repetition_penalty
-
+compute_score = paper_compute_score
 
 
 @register("search_r1_qa_em")
@@ -134,7 +24,7 @@ class SearchR1QAEMRewardManager:
         
         self.tokenizer = tokenizer
         self.num_examine = num_examine
-        self.compute_score = compute_score or _default_compute_score
+        self.compute_score = compute_score or paper_compute_score
         self.format_score = format_score
         self.score = score
 
@@ -158,19 +48,19 @@ class SearchR1QAEMRewardManager:
         for i in range(len(data)):
             data_item = data[i]
 
-            prompt_ids = data_item.batch['prompts']
-            prompt_length = prompt_ids.shape[-1]
-
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
-
+            prompt_length = data_item.batch['prompts'].shape[-1]
             response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # Decode the full sequence
-            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
-            sequences_str = self.tokenizer.decode(sequences)
+            response_attention = data_item.batch['attention_mask'][prompt_length:]
+            valid_response_length = int(response_attention.sum().item())
+            # AgentLoopOutput marks model tokens 1, tool observations/padding 0.
+            # Older full-sequence loss_mask uses the same convention.
+            generated_mask = data_item.batch.get('response_mask')
+            if generated_mask is None and 'loss_mask' in data_item.batch:
+                generated_mask = data_item.batch['loss_mask'][prompt_length:]
+            sequences_str = decode_generated_response(
+                self.tokenizer, response_ids.tolist(), response_attention.tolist(),
+                generated_mask.tolist() if generated_mask is not None else None,
+            )
 
             # Get ground truth
             if 'reward_model' in data_item.non_tensor_batch:
@@ -181,7 +71,7 @@ class SearchR1QAEMRewardManager:
                               data_item.non_tensor_batch.get('golden_answers', []))
 
             # Compute score
-            score = compute_score(
+            score = self.compute_score(
                 solution_str=sequences_str, 
                 ground_truth=ground_truth, 
                 format_score=self.format_score,
@@ -192,11 +82,10 @@ class SearchR1QAEMRewardManager:
             else:
                 reward_extra_info['wrong_response_length'].append(valid_response_length)
 
-            # TODO: check if logic is correct
-            # update this score to the scores
             scores[i] = {"score": score}
 
-            reward_tensor[i, valid_response_length - 1] = score
+            if valid_response_length:
+                reward_tensor[i, valid_response_length - 1] = score
 
             # Print examples for debugging
             data_source = data_item.non_tensor_batch.get('data_source', 'unknown')
@@ -212,20 +101,9 @@ class SearchR1QAEMRewardManager:
                 print("=" * 50)
 
 
-        for i, score in enumerate(scores):
-            if isinstance(score, dict):
-                
-                # convert the length to a Python int
-                length_i = data[i].batch['attention_mask'][data[i].batch['prompts'].shape[-1]:].sum().item()
-                # subtract 1 because you want the last *valid* token
-                reward_tensor[i, length_i - 1] = score['score']
-
-                # reward_tensor[i, valid_response_length[i].item() - 1] = score['score']
-                for k, v in score.items():
-                    reward_extra_info[k].append(v)
-            else:
-                length_i = data[i].batch['attention_mask'][data[i].batch['prompts'].shape[-1]:].sum().item()
-                reward_tensor[i, length_i - 1] = score
+        for score_info in scores:
+            for key, value in score_info.items():
+                reward_extra_info[key].append(value)
 
         correct_response_length_mean = np.mean(reward_extra_info['correct_response_length']) if reward_extra_info['correct_response_length'] else 0.0
         wrong_response_length_mean = np.mean(reward_extra_info['wrong_response_length']) if reward_extra_info['wrong_response_length'] else 0.0
