@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "checked_at_utc": "2026-11-03T12:25:19+00:00",
+  "status": "passed",
+  "scope": "configuration_and_retrieval_tests_only",
+  "configuration_commit": "fd4b32037a4e42d59dbc3c65a4059c728fc90178",
+  "corpus": {
+    "total_documents": 24024548,
+    "pubmed": {
+      "dataset": "MedRAG/pubmed",
+      "revision": "33da3593d5756bc04c8909f170003c0b14197957",
+      "documents": 23898701,
+      "source_shards": 1166
+    },
+    "textbooks": {
+      "dataset": "MedRAG/textbooks",
+      "revision": "9c72838920a1323ffa867467d3f7aa7b36b0f994",
+      "documents": 125847
+    },
+    "manifest_verified": true
+  },
+  "index": {
+    "type": "IndexFlatIP",
+    "dimension": 768,
+    "vectors": 24024548,
+    "bytes": 73803411501,
+    "pooling": "cls",
+    "corpus_counts_match": true,
+    "build_exit_code": 0
+  },
+  "retrieval_service": {
+    "endpoint": "http://127.0.0.1:18501/retrieve",
+    "pid_at_check": 3385939,
+    "encoder_device": "cpu",
+    "encoder_precision": "float32",
+    "search_device": "cpu",
+    "search_precision": "float32",
+    "search_is_exact": true,
+    "cuda_visible_devices": "",
+    "gpu_process_allocation_absent": true,
+    "omp_threads": 8,
+    "mkl_threads": 8,
+    "openblas_threads": 8,
+    "topk_requested": 3,
+    "topk_returned": 3,
+    "nonempty_documents": 3,
+    "scores_finite_and_descending": true
+  },
+  "tool_chain": {
+    "endpoint": "http://127.0.0.1:18502/get_observation",
+    "valid": true,
+    "done": false,
+    "references_returned": 3,
+    "observation_characters": 6952,
+    "matches_direct_retrieval_content": true,
+    "full_readiness_exit_code": 0
+  },
+  "configuration_tests": {
+    "cpu_device_cases": 3,
+    "cpu_device_test_exit_code": 0,
+    "reward_formula_and_factory_cases": 9,
+    "reward_formula_and_factory_skipped": 0,
+    "reward_factory_cpu_exit_code": 0,
+    "real_dataproto_factory_test_passed": true,
+    "hydra_resolved_config_exit_code": 0,
+    "paper_reward_path_and_name_verified": true,
+    "single_gpu_tp1_foreach_false_schema_verified": true
+  },
+  "training": {
+    "disabled_by_user": true,
+    "automatic_queue_present": false,
+    "smoke_output_exists": false,
+    "curriculum_sampling_started": false,
+    "optimizer_step_executed": false,
+    "formal_training_started": false,
+    "four_gpu_training_runtime_tested": false
+  },
+  "evidence_files_on_server": [
+    "logs/build-index-complete.log",
+    "logs/build-index-complete.exit",
+    "logs/full-retrieval-readiness.log",
+    "logs/full-retrieval-readiness.exit",
+    "logs/cpu-retrieval-device-test.log",
+    "logs/reward-factory-cpu-test.log",
+    "logs/hydra-reward-config-test.log",
+    "logs/medtiv-training-disabled-by-user"
+  ],
+  "limitations": [
+    "本次全量检索验收使用CPU FP32查询编码与CPU精确FlatIP搜索，数值路径不同于原GPU FP16查询及FP16索引克隆。",
+    "仅验证配置、奖励接线和完整检索工具链；未执行课程采样、optimizer更新或正式训练，不构成论文benchmark结果。"
+  ]
+}
