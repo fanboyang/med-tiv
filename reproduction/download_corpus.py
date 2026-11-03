@@ -7,6 +7,7 @@
 源级转换从头重做，已完成源直接复用。无抽样、无静默跳源、无哈希复核。
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,17 @@ SOURCES = {
     'pubmed': {'dataset': 'MedRAG/pubmed', 'revision': '33da3593d5756bc04c8909f170003c0b14197957'},
 }
 FORMAT_VERSION = 1
+# 固定revision的完整chunk清单，经dataset-info siblings实际核验。
+EXPECTED_CHUNKS = {
+    'pubmed': tuple(f'chunk/pubmed23n{i:04d}.jsonl' for i in range(1, 1167)),
+    'textbooks': tuple('chunk/'+name+'.jsonl' for name in (
+        'Anatomy_Gray', 'Biochemistry_Lippincott', 'Cell_Biology_Alberts',
+        'First_Aid_Step1', 'First_Aid_Step2', 'Gynecology_Novak', 'Histology_Ross',
+        'Immunology_Janeway', 'InternalMed_Harrison', 'Neurology_Adams',
+        'Obstentrics_Williams', 'Pathology_Robbins', 'Pathoma_Husain',
+        'Pediatrics_Nelson', 'Pharmacology_Katzung', 'Physiology_Levy',
+        'Psichiatry_DSM-5', 'Surgery_Schwartz')),
+}
 
 
 def atomic_json(path, value):
@@ -48,16 +60,60 @@ def convert_document(item, source, index):
             'source': source}
 
 
+def hf_local_files(source, num_proc=8, offline=False):
+    """单次仓库元数据获取完整清单；不访问会分页的HF tree API。"""
+    from huggingface_hub import HfApi, hf_hub_download, try_to_load_from_cache
+    from huggingface_hub.constants import ENDPOINT
+    if num_proc <= 0:
+        raise ValueError('num_proc 必须为正数')
+    specification = SOURCES[source]
+    endpoint = os.environ.get('HF_ENDPOINT', ENDPOINT)
+    info = HfApi(endpoint=endpoint).dataset_info(specification['dataset'], revision=specification['revision'])
+    names = [item.rfilename for item in info.siblings if item.rfilename.startswith('chunk/')]
+    expected = EXPECTED_CHUNKS[source]
+    if (info.sha != specification['revision'] or len(names) != len(expected)
+            or set(names) != set(expected)):
+        raise ValueError(f'{source}: 固定revision完整文件清单不符；'
+                         f'expected={len(expected)}, actual={len(names)}, revision={info.sha}')
+
+    def obtain(filename):
+        # 不传cache_dir：Hub缓存沿用当前HF_HOME，与已有54GB缓存相同。
+        cached = try_to_load_from_cache(specification['dataset'], filename=filename,
+                                        revision=specification['revision'], repo_type='dataset')
+        if isinstance(cached, str):
+            path = cached
+        else:
+            path = hf_hub_download(repo_id=specification['dataset'], filename=filename,
+                                   revision=specification['revision'], repo_type='dataset',
+                                   endpoint=endpoint, local_files_only=offline)
+        if not Path(path).is_file() or Path(path).stat().st_size <= 0:
+            raise ValueError(f'{source}: 分片未完整落盘 {filename}')
+        return str(path)
+
+    executor = ThreadPoolExecutor(max_workers=num_proc)
+    futures = {executor.submit(obtain, name): name for name in sorted(names)}
+    paths = {}
+    try:
+        for future in as_completed(futures):
+            paths[futures[future]] = future.result()
+    finally:
+        # 任一分片失败，取消尚未开始的下载；异常继续向上抛出，不能交付部分清单。
+        executor.shutdown(wait=True, cancel_futures=True)
+    if len(paths) != len(expected):
+        raise ValueError(f'{source}: 本地分片不完整 {len(paths)}/{len(expected)}')
+    print(f'{source}: 固定revision全部 {len(paths)} 个分片已在HF缓存就绪', flush=True)
+    return [paths[name] for name in sorted(names)]
+
+
 def load_hf_source(source, cache_dir=None, num_proc=8, offline=False):
     if offline:
         os.environ['HF_DATASETS_OFFLINE'] = '1'
         os.environ['HF_HUB_OFFLINE'] = '1'
-    from datasets import DownloadConfig, load_dataset
-    specification = SOURCES[source]
-    # 无 force_redownload：失败的下载由 HF 按同一固定revision缓存恢复。
-    return load_dataset(specification['dataset'], split='train', revision=specification['revision'],
-                        cache_dir=cache_dir, num_proc=num_proc,
-                        download_config=DownloadConfig(local_files_only=offline, num_proc=num_proc))
+    paths = hf_local_files(source, num_proc=num_proc, offline=offline)
+    from datasets import load_dataset
+    # 只给JSON builder显式本地路径，彻底避免HF仓库树枚举和分页Link。
+    return load_dataset('json', data_files={'train': paths}, split='train',
+                        cache_dir=cache_dir, num_proc=num_proc)
 
 
 def quarantine(path):
@@ -107,7 +163,8 @@ def prepare_source(output_dir, source, cache_dir=None, num_proc=8, offline=False
     partial.replace(final)
     state = {'status': 'complete', 'format_version': FORMAT_VERSION, 'source': source,
              **expected_source, 'split': 'train', 'documents': count, 'expected_documents': expected_count,
-             'bytes': final.stat().st_size, 'file': final.name}
+             'bytes': final.stat().st_size, 'file': final.name,
+             'expected_source_shards': len(EXPECTED_CHUNKS[source])}
     atomic_json(manifest_path, state)
     print(f'完成源 {source}: {count} documents', flush=True)
     return state

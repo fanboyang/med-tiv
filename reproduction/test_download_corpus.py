@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 def module():
@@ -17,6 +19,61 @@ def module():
 
 
 class DownloadCorpusTests(unittest.TestCase):
+    def test_hf_metadata_and_fixed_revision_cache_avoid_tree_pagination(self):
+        m = module()
+        revision = m.SOURCES['pubmed']['revision']
+        filenames = [f'chunk/pubmed23n{i:04d}.jsonl' for i in range(1, 1167)]
+        metadata = SimpleNamespace(sha=revision, siblings=[SimpleNamespace(rfilename=f) for f in filenames])
+        with tempfile.TemporaryDirectory() as temp:
+            cached = Path(temp)/'cached.jsonl'
+            cached.write_text('{}\n')
+            with patch.dict('os.environ', {'HF_ENDPOINT': 'https://hf-mirror.com'}), \
+                 patch('huggingface_hub.HfApi') as api, \
+                 patch('huggingface_hub.try_to_load_from_cache', return_value=str(cached)) as lookup, \
+                 patch('huggingface_hub.hf_hub_download') as download:
+                api.return_value.dataset_info.return_value = metadata
+                paths = m.hf_local_files('pubmed', num_proc=2)
+                self.assertEqual(len(paths), 1166)
+                api.assert_called_once_with(endpoint='https://hf-mirror.com')
+                api.return_value.dataset_info.assert_called_once_with('MedRAG/pubmed', revision=revision)
+                self.assertEqual(lookup.call_count, 1166)
+                self.assertEqual(lookup.call_args.kwargs['revision'], revision)
+                download.assert_not_called()
+                # 缺片只恢复该固定revision文件，仍使用默认HF_HOME下hub缓存。
+                missing = filenames[-1]
+                lookup.side_effect = lambda *a, **kw: None if kw['filename'] == missing else str(cached)
+                download.return_value = str(cached)
+                self.assertEqual(len(m.hf_local_files('pubmed', num_proc=2)), 1166)
+                self.assertEqual(download.call_count, 1)
+                self.assertEqual(download.call_args.kwargs['revision'], revision)
+                self.assertEqual(download.call_args.kwargs['endpoint'], 'https://hf-mirror.com')
+                self.assertNotIn('cache_dir', download.call_args.kwargs)
+                download.side_effect = RuntimeError('missing shard transfer failed')
+                with self.assertRaisesRegex(RuntimeError, 'transfer failed'):
+                    m.hf_local_files('pubmed', num_proc=2)
+
+    def test_missing_shard_metadata_or_revision_mismatch_fails(self):
+        m = module()
+        revision = m.SOURCES['pubmed']['revision']
+        full = [SimpleNamespace(rfilename=f'chunk/pubmed23n{i:04d}.jsonl') for i in range(1, 1167)]
+        renamed = full[:-1]+[SimpleNamespace(rfilename='chunk/unexpected.jsonl')]
+        for metadata in [SimpleNamespace(sha=revision, siblings=full[:-1]),
+                         SimpleNamespace(sha=revision, siblings=renamed),
+                         SimpleNamespace(sha='another-revision', siblings=full)]:
+            with patch('huggingface_hub.HfApi') as api:
+                api.return_value.dataset_info.return_value = metadata
+                with self.assertRaises(ValueError):
+                    m.hf_local_files('pubmed', num_proc=1)
+
+    def test_dataset_loader_uses_only_explicit_local_json_paths(self):
+        m = module()
+        with patch.object(m, 'hf_local_files', return_value=['/local/shard.jsonl']) as files, \
+             patch('datasets.load_dataset', return_value='dataset') as load:
+            self.assertEqual(m.load_hf_source('pubmed', cache_dir='/dataset-cache', num_proc=2), 'dataset')
+            self.assertEqual(load.call_args.args, ('json',))
+            self.assertEqual(load.call_args.kwargs['data_files'], {'train': ['/local/shard.jsonl']})
+            self.assertNotIn('revision', load.call_args.kwargs)
+
     def test_text_and_title_follow_author_format(self):
         m = module()
         self.assertEqual(m.convert_document({'id': 'x', 'title': 'Title', 'content': 'Body'}, 'pubmed', 0),
