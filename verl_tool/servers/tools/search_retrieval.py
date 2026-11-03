@@ -5,6 +5,7 @@ Search Retrieval Tool for verl-tool
 - Logging: Immediate writes with proper synchronization
 """
 from .base import BaseTool, register_tool
+from .errors import RetrievalServiceError
 import regex as re
 import requests
 from typing import Tuple, Dict, Any, List
@@ -158,6 +159,7 @@ class SearchRetrievalTool(BaseTool):
     def conduct_action(self, trajectory_id, action, extra_field):
         parsed_query, is_valid = self._parse_search_query(action)
         env = self.load_env(trajectory_id)
+        execution_result = ""
         
         if not is_valid:
             parsed_query, is_valid = self._parse_answer_tags(action)
@@ -226,10 +228,7 @@ class SearchRetrievalTool(BaseTool):
                 logger.error(f"[Trajectory {trajectory_id}] SEARCH FAILED: {e}", exc_info=True)
                 self._flush_logs()
                 
-                execution_result = f"Search error: {str(e)}"
-                observation = f'\n\n<information>Search temporarily unavailable</information>\n\n'
-                done = False
-                valid = False
+                raise RetrievalServiceError("Retrieval execution failed") from e
         
         self.update_env(trajectory_id, env, parsed_query, is_valid, extra_field, execution_result)
         self.save_env(trajectory_id, env)
@@ -294,6 +293,7 @@ class SearchRetrievalTool(BaseTool):
         
         # Retry up to 3 times with exponential backoff
         max_retries = 3
+        last_error = None
         for attempt in range(max_retries):
             try:
                 # Progressive timeout: multi-GPU server can handle parallel, but large index needs time
@@ -304,9 +304,23 @@ class SearchRetrievalTool(BaseTool):
                 response.raise_for_status()
                 
                 # Success - return results
-                return response.json().get('result', [[]])
+                result = response.json()
+                if not isinstance(result, dict) or not isinstance(result.get('result'), list):
+                    raise RetrievalServiceError('Missing/malformed retrieval result array')
+                rows=result['result']
+                if len(rows) != len(queries) or any(not isinstance(row,list) for row in rows):
+                    raise RetrievalServiceError('Retrieval result count/type differs from queries')
+                for row in rows:
+                    for item in row:
+                        if not isinstance(item,dict):
+                            raise RetrievalServiceError('Retrieval hit must be an object')
+                        document=item.get('document',item)
+                        if not isinstance(document,dict) or not isinstance(document.get('text'),str):
+                            raise RetrievalServiceError('Retrieval hit is missing document text')
+                return rows
                 
-            except requests.exceptions.Timeout:
+            except requests.exceptions.Timeout as e:
+                last_error = e
                 with self.stats_lock:
                     self.timeout_count += 1
                     if attempt < max_retries - 1:
@@ -319,6 +333,7 @@ class SearchRetrievalTool(BaseTool):
                     time.sleep(backoff)
                     
             except requests.exceptions.RequestException as e:
+                last_error = e
                 with self.stats_lock:
                     if attempt < max_retries - 1:
                         self.retry_count += 1
@@ -330,13 +345,14 @@ class SearchRetrievalTool(BaseTool):
                     time.sleep(backoff)
                     
             except Exception as e:
+                last_error = e
                 logger.error(f"Unexpected error at {url}: {e}")
                 break  # Don't retry on unexpected errors
         
         # All retries exhausted
         logger.error(f"Retrieval server failed after {max_retries} attempts.")
         self._flush_logs()
-        return [[] for _ in queries]
+        raise RetrievalServiceError("Retrieval service failed") from last_error
 
     def _passages2string(self, retrieval_result: List[Dict]) -> str:
         if not retrieval_result: return ''

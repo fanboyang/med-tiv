@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, field_validator, ValidationInfo
 import concurrent.futures
 
 from .utils import hash_requests
+from .tools.errors import RetrievalServiceError
 from .tools import get_tool_cls, ALL_TOOLS, set_use_tqdm
 
 # Configure structured logging
@@ -383,6 +384,9 @@ class AsyncToolManager:
                     dones[result_idx] = tool_dones[idx_pos]
                     valids[result_idx] = tool_valids[idx_pos]
                     
+            except RetrievalServiceError:
+                # Infrastructure failures must reach the HTTP layer, not model observations.
+                raise
             except Exception as e:
                 logger.error(f"Tool {tool_type} processing failed: {e}", exc_info=True)
                 
@@ -581,6 +585,8 @@ class AsyncToolServer:
                         ),
                         timeout=self.config.request_timeout
                     )
+                except RetrievalServiceError as e:
+                    raise HTTPException(status_code=503, detail="Retrieval service unavailable") from e
                 except Exception as e:
                     logger.error(f"Error during action processing: {e}", exc_info=True)
                     raise HTTPException(status_code=500, detail=f"Action processing failed: {str(e)}")
@@ -605,8 +611,10 @@ class AsyncToolServer:
                 
                 return response
                 
+            except HTTPException:
+                raise
             except asyncio.TimeoutError:
-                raise HTTPException(status_code=408, detail="Request processing timeout")
+                raise HTTPException(status_code=504, detail="Request processing timeout")
             except Exception as e:
                 logger.error(f"Request processing failed: {e}", exc_info=True)
                 raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")

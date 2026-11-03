@@ -211,26 +211,18 @@ def build_index(
     rr = 0
     batch_texts: List[str] = []
 
-    def _finalize_text(line: str) -> str:
-        if not line.strip():
-            text = "empty_document_placeholder"
-            return _maybe_add_prefix([text], is_query=False, model_name=model_name)[0]
+    def _finalize_text(line: str, line_number: int) -> str:
         try:
             doc = json.loads(line)
-            text = doc.get("text", "")
-        except json.JSONDecodeError:
-            text = "json_error_placeholder"
-            return _maybe_add_prefix([text], is_query=False, model_name=model_name)[0]
-
-        if not text or len(text.strip()) < 10:
-            title = doc.get("title", "")
-            if isinstance(title, str) and len(title.strip()) > 5:
-                text = title.strip()
-            else:
-                text = "empty_document_placeholder"
-
-        text = _maybe_add_prefix([text], is_query=False, model_name=model_name)[0]
-        return text
+        except json.JSONDecodeError as error:
+            raise ValueError(f"corpus line {line_number}: invalid JSON") from error
+        if not isinstance(doc, dict):
+            raise ValueError(f"corpus line {line_number}: document must be a JSON object")
+        text = doc.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"corpus line {line_number}: text must be a nonempty string")
+        # Preserve every valid source text, including short documents and whitespace.
+        return _maybe_add_prefix([text], is_query=False, model_name=model_name)[0]
 
     def _dispatch(batch_id: int, texts: List[str]):
         nonlocal rr
@@ -268,7 +260,7 @@ def build_index(
             if max_docs and (line_idx >= max_docs):
                 break
 
-            batch_texts.append(_finalize_text(line))
+            batch_texts.append(_finalize_text(line, line_number=line_idx + 1))
 
             if len(batch_texts) >= batch_size:
                 _dispatch(batch_id, batch_texts)
