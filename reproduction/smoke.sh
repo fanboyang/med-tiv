@@ -9,6 +9,7 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export CUDA_VISIBLE_DEVICES=''
 model="$root/models/Qwen2.5-7B-Instruct"
 output="$root/outputs/smoke/integration-v1"
+export MEDTIV_RAY_TMPDIR="$root/tmp/smoke"
 export MEDTIV_RUNTIME_DIR="$output/runtime" MEDTIV_RUN_NAME=medtiv-integration-smoke-v1
 python - "$root" "$output" <<'PY'
 import json,random,subprocess,sys,urllib.request

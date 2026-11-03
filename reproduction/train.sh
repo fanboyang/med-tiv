@@ -14,7 +14,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 export NCCL_DEBUG=WARN VLLM_USE_V1=1 WANDB_MODE=disabled
 export no_proxy="localhost,127.0.0.1,0.0.0.0,$(hostname -i)"
 runtime_dir=${MEDTIV_RUNTIME_DIR:-$root/outputs}
-export RAY_TMPDIR="$runtime_dir/ray"
+export RAY_TMPDIR="${MEDTIV_RAY_TMPDIR:-$root/tmp/ray}"
 mkdir -p "$RAY_TMPDIR"
 val_data="$root/data/prepared/validation.parquet"
 rl_alg=grpo
