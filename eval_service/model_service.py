@@ -38,6 +38,22 @@ def sanitize_request(obj: Any) -> Any:
     else:
         return obj
     
+class ToolServerError(RuntimeError):
+    """A transport/protocol failure in the external tool service, never model output."""
+
+
+def validate_tool_response(result, expected):
+    if not isinstance(result, dict):
+        raise ToolServerError('Tool server response must be an object')
+    for key, kind in [('observations', str), ('dones', bool), ('valids', bool)]:
+        values=result.get(key)
+        if not isinstance(values, list) or len(values) != expected:
+            raise ToolServerError(f'Tool server response has invalid {key} length/type')
+        if any(type(value) is not kind for value in values):
+            raise ToolServerError(f'Tool server response has invalid {key} values')
+    return result
+
+
 class ModelService:
     """verl-tool model inference service"""
     
@@ -66,17 +82,12 @@ class ModelService:
         }
         try:
             data = sanitize_request(data)
-            response = requests.post(server_url, json=data)
+            response = requests.post(server_url, json=data, timeout=120)
             response.raise_for_status()
             result = response.json()
-            return result   
+            return validate_tool_response(result, len(trajectory_ids))
         except Exception as e:
-            print(f"Error calling tool server: {str(e)}")
-            return {
-                "observations": [f"Error calling tool server: {str(e)}" for _ in range(len(trajectory_ids))],
-                "dones": [True for _ in range(len(trajectory_ids))],
-                "valids": [False for _ in range(len(trajectory_ids))]
-            }
+            raise ToolServerError('Tool server request failed') from e
     
     async def call_tool_server_async(self, trajectory_ids: List[str], actions: List[str], finish: List[bool], **kwargs: Dict[str, List[Any]]) -> Dict[str, Any]:
         """querying the tool server for the observation and done flag using aiohttp"""
@@ -93,17 +104,12 @@ class ModelService:
             
         try:
             data = sanitize_request(data)
-            async with self.session.post(server_url, json=data) as response:
+            async with self.session.post(server_url, json=data, timeout=aiohttp.ClientTimeout(total=120)) as response:
                 response.raise_for_status()
                 result = await response.json()
-                return result
+                return validate_tool_response(result, len(trajectory_ids))
         except Exception as e:
-            print(f"Error calling tool server: {str(e)}")
-            return {
-                "observations": [f"Error calling tool server: {str(e)}" for _ in range(len(trajectory_ids))],
-                "dones": [True for _ in range(len(trajectory_ids))],
-                "valids": [False for _ in range(len(trajectory_ids))]
-            }
+            raise ToolServerError('Tool server request failed') from e
     
     async def post_process_observations(self, next_obs: List[str], dones: List[bool], valid_action: List[bool], finishs: List[bool]):
         """Process observations using the tokenizer with proper async locks"""

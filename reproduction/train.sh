@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Usage: bash reproduction/train.sh ITER MODEL TRAIN_PARQUET [hydra overrides]
+root=${MEDTIV_ROOT:-/data/fby/med-tiv}
+iteration=${1:?iteration required}
+model_name=${2:?model path required}
+train_data=${3:?curriculum parquet required}
+[[ "$iteration" == 1 || "$iteration" == 2 ]] || exit 2
+source "$root/env/bin/activate"
+cd "$root/code"
+export PYTHONPATH="$PWD:$PWD/verl${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export NCCL_DEBUG=WARN VLLM_USE_V1=1 WANDB_MODE=disabled
+export no_proxy="localhost,127.0.0.1,0.0.0.0,$(hostname -i)"
+export RAY_TMPDIR="$root/tmp/ray"
+mkdir -p "$RAY_TMPDIR"
+val_data="$root/data/prepared/validation.parquet"
+rl_alg=grpo
+n_gpus_per_node=4
+n_nodes=1
+n=5
+[[ "$iteration" == 2 ]] && n=8
+total_epochs=5
+batch_size=256
+ppo_mini_batch_size=256
+max_prompt_length=8192
+max_action_length=1024
+max_response_length=8192
+max_obs_length=2048
+temperature=1.0
+top_p=0.95
+enable_agent=True
+strategy=fsdp
+max_turns=4
+kl_loss_coef=0
+kl_coef=0
+entropy_coeff=0
+kl_loss_type=low_var_kl
+lr=1e-6
+reward_manager=search_r1_qa_em
+ppo_micro_batch_size_per_gpu=1
+log_prob_micro_batch_size_per_gpu=1
+tensor_model_parallel_size=4
+gpu_memory_utilization=0.55
+do_offload=True
+use_dynamic_bsz=True
+ulysses_sequence_parallel_size=1
+fsdp_size=-1
+additional_eos_token_ids=$(python -c 'from transformers import AutoTokenizer; import sys,json; t=AutoTokenizer.from_pretrained(sys.argv[1],local_files_only=True); print(json.dumps([t.eos_token_id]))' "$model_name")
+mask_observations=True
+enable_mtrl=False
+rollout_mode=async
+run_name="medtiv-qwen7b-iter${iteration}"
+export VERL_RUN_ID="$run_name"
+export MEDTIV_DRGRPO_NORMALIZER=8192
+checkpoint_dir="$root/outputs/iter${iteration}"
+tool_server_url=http://127.0.0.1:18502/get_observation
+action_stop_tokens_file="$root/outputs/action_stop_tokens.txt"
+mkdir -p "$root/outputs"
+printf '</search>,</answer>' > "$action_stop_tokens_file"
+PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
+    algorithm.adv_estimator=$rl_alg \
+    +ray_kwargs.ray_init.runtime_env.env_vars.MEDTIV_DRGRPO_NORMALIZER='"8192"' \
+    algorithm.norm_adv_by_std_in_grpo=False \
+    algorithm.use_kl_in_reward=True \
+    data.train_files=$train_data \
+    data.val_files=$val_data \
+    data.train_batch_size=$batch_size \
+    data.val_batch_size=2048 \
+    data.max_prompt_length=$max_prompt_length \
+    data.max_response_length=$max_response_length \
+    data.truncation='error' \
+    reward_model.reward_manager=$reward_manager \
+    reward_model.launch_reward_fn_async=True \
+    actor_rollout_ref.model.path=$model_name \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.optim.lr=$lr \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.trust_remote_code=True \
+    actor_rollout_ref.actor.checkpoint.save_contents=['model','optimizer','extra','hf_model'] \
+    actor_rollout_ref.actor.ppo_mini_batch_size=$ppo_mini_batch_size \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$ppo_micro_batch_size_per_gpu \
+    actor_rollout_ref.actor.use_dynamic_bsz=$use_dynamic_bsz \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.strategy=$strategy \
+    actor_rollout_ref.actor.kl_loss_coef=$kl_loss_coef \
+    actor_rollout_ref.actor.kl_loss_type=$kl_loss_type \
+    actor_rollout_ref.actor.clip_ratio_high=0.3 \
+    actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    actor_rollout_ref.actor.loss_agg_mode='seq-mean-token-sum-norm' \
+    actor_rollout_ref.actor.entropy_coeff=$entropy_coeff \
+    actor_rollout_ref.actor.fsdp_config.param_offload=$do_offload \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=$do_offload \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=$fsdp_size \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=$ulysses_sequence_parallel_size \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 \
+    actor_rollout_ref.agent.enable_agent=$enable_agent \
+    actor_rollout_ref.agent.tool_server_url=$tool_server_url \
+    actor_rollout_ref.agent.max_prompt_length=$max_prompt_length \
+    actor_rollout_ref.agent.max_response_length=$max_response_length \
+    actor_rollout_ref.agent.max_start_length=$max_prompt_length \
+    actor_rollout_ref.agent.max_obs_length=$max_obs_length \
+    actor_rollout_ref.agent.max_turns=$max_turns \
+    actor_rollout_ref.agent.additional_eos_token_ids=$additional_eos_token_ids \
+    actor_rollout_ref.agent.mask_observations=$mask_observations \
+    actor_rollout_ref.agent.action_stop_tokens=$action_stop_tokens_file \
+    actor_rollout_ref.agent.enable_mtrl=$enable_mtrl \
+    actor_rollout_ref.agent.max_action_length=$max_action_length \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=$tensor_model_parallel_size \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$log_prob_micro_batch_size_per_gpu \
+    actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.free_cache_engine=True \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=$gpu_memory_utilization \
+    actor_rollout_ref.rollout.temperature=$temperature \
+    actor_rollout_ref.rollout.top_p=$top_p \
+    actor_rollout_ref.rollout.top_k=-1 \
+    actor_rollout_ref.rollout.n=$n \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=$use_dynamic_bsz \
+    actor_rollout_ref.rollout.max_num_seqs=128 \
+    actor_rollout_ref.rollout.mode=$rollout_mode \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=$use_dynamic_bsz \
+    actor_rollout_ref.ref.fsdp_config.param_offload=$do_offload \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$log_prob_micro_batch_size_per_gpu \
+    actor_rollout_ref.ref.ulysses_sequence_parallel_size=$ulysses_sequence_parallel_size \
+    critic.optim.lr=1e-5 \
+    critic.strategy=$strategy \
+    critic.model.path=$model_name \
+    critic.model.fsdp_config.fsdp_size=$fsdp_size \
+    critic.ppo_micro_batch_size_per_gpu=$ppo_micro_batch_size_per_gpu \
+    critic.ulysses_sequence_parallel_size=$ulysses_sequence_parallel_size \
+    algorithm.kl_ctrl.kl_coef=$kl_coef \
+    trainer.logger=['console','tensorboard'] \
+    trainer.project_name=$reward_manager \
+    trainer.experiment_name=$run_name \
+    trainer.val_before_train=False \
+    trainer.default_hdfs_dir=null \
+    trainer.default_local_dir=$checkpoint_dir \
+    trainer.n_gpus_per_node=$n_gpus_per_node \
+    trainer.nnodes=$n_nodes \
+    +trainer.remove_previous_ckpt_in_save=False \
+    trainer.save_freq=100 \
+    trainer.test_freq=50 \
+    trainer.total_epochs=$total_epochs "${@:4}"

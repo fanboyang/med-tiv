@@ -13,6 +13,7 @@ import re
 import threading
 import urllib.request
 from urllib.error import HTTPError, URLError
+from reproduction.reward import strip_observations
 
 
 def option_map(row):
@@ -39,6 +40,7 @@ def parse_answer(text, allowed):
 
 
 def parse_verdict(text):
+    text = strip_observations(text)
     matches = re.findall(r'<answer>(.*?)</answer>', text, re.DOTALL)
     if not matches or matches[-1].strip() not in ('0','1'):
         return None

@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional
 from transformers import HfArgumentParser
 import uvicorn
 from config import ServerConfig, ModelConfig, ToolConfig
-from model_service import ModelService
+from model_service import ModelService, ToolServerError
 
 # Set up logging
 logging.basicConfig(
@@ -84,6 +84,9 @@ def create_app(server_config: ServerConfig, model_config: ModelConfig, tool_conf
             logger.debug(f"Received completions request: {json.dumps(request_body)}")
             response = await app.state.model_service.completions_async(request_body)
             return response
+        except ToolServerError as e:
+            logger.error("Tool server unavailable: %s", type(e.__cause__).__name__)
+            raise HTTPException(status_code=503, detail="Tool server unavailable") from e
         except Exception as e:
             error_details = traceback.format_exc()
             logger.error(f"Error in completions endpoint: {str(e)}\n{error_details}")
@@ -101,6 +104,9 @@ def create_app(server_config: ServerConfig, model_config: ModelConfig, tool_conf
             logger.debug(f"Received chat completions request: {json.dumps(request_body)}")
             response = await app.state.model_service.chat_completions_async(request_body)
             return response
+        except ToolServerError as e:
+            logger.error("Tool server unavailable: %s", type(e.__cause__).__name__)
+            raise HTTPException(status_code=503, detail="Tool server unavailable") from e
         except Exception as e:
             error_details = traceback.format_exc()
             logger.error(f"Error in chat completions endpoint: {str(e)}\n{error_details}")

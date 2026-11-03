@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import os
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -797,11 +798,13 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         loss = verl_F.masked_mean(seq_losses, seq_mask)  # seq-mean
     elif loss_agg_mode == "seq-mean-token-sum-norm":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
-        loss = torch.sum(seq_losses) / loss_mask.shape[-1]  # The divisor
-        # (loss_mask.shape[-1]) should ideally be constant
-        # throughout training to well-replicate the DrGRPO paper.
-        # TODO: Perhaps add user-defined normalizer argument to
-        # agg_loss to ensure divisor stays constant throughout.
+        if os.environ.get("MEDTIV_DRGRPO_NORMALIZER") == "8192":
+            # dp_actor weights each microbatch mean by its share of the
+            # minibatch before backward; sum here would scale with its size.
+            # Include masked-out rows so that weighting remains consistent.
+            loss = torch.mean(seq_losses) / 8192
+        else:
+            loss = torch.sum(seq_losses) / loss_mask.shape[-1]
     else:
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
