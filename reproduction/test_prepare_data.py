@@ -37,6 +37,40 @@ class PrepareDataTests(unittest.TestCase):
             self.assertNotIn(forbidden, prompt)
         self.assertEqual(records[0]['prompt'][0]['role'], 'user')
 
+    def test_upstream_empty_options_preserve_positions_and_trace_count(self):
+        m = module()
+        # 固定revision真实row2127的options；空项来自上游解析损坏，不能删去或补全。
+        row = fixture()
+        row['options'] = ['[30 /', '', '[70 /', '', '[1 /']
+        records = list(m.medprm_records([row]))
+        self.assertEqual(len(records), 2)
+        self.assertIn('Options:\n(A) [30 /\n(B) \n(C) [70 /\n(D) \n(E) [1 /', records[0]['prompt'][0]['content'])
+        self.assertEqual(records[0]['extra_info']['empty_option_indices'], [1, 3])
+        row['options'] = ['', '', '', '', '']
+        self.assertEqual(len(list(m.medprm_records([row]))), 2)
+        row['options'] = ['original option'] * 15
+        anomalous = list(m.medprm_records([row]))
+        self.assertEqual(anomalous[0]['extra_info']['source_option_count'], 15)
+        self.assertTrue(anomalous[0]['extra_info']['unusual_option_count'])
+        self.assertIn('(O) original option', anomalous[0]['prompt'][0]['content'])
+        row['options'][0] = None
+        with self.assertRaisesRegex(ValueError, 'option 0'):
+            list(m.medprm_records([row]))
+
+    def test_data_quality_summary_counts_questions_and_traces(self):
+        m = module()
+        empty = fixture(1)
+        empty['options'] = ['a', '', 'c', '', 'e']
+        long = fixture(2)
+        long['options'] = ['source value'] * 15
+        normal_three = fixture(3)
+        normal_three['options'] = ['yes', 'no', 'maybe']
+        records = list(m.medprm_records([empty, long, normal_three]))
+        summary = m.data_quality_summary(records)
+        self.assertEqual(summary['empty_options'], {'questions': 1, 'traces': 2, 'question_ids': ['1']})
+        self.assertEqual(summary['unusual_option_count'], {'questions': 1, 'traces': 2, 'question_ids': ['2']})
+        self.assertEqual(summary['unusual_question_option_counts'], {'2': 15})
+
     def test_empty_solutions_contribute_no_traces_but_missing_schema_fails(self):
         m = module()
         row = fixture()
@@ -100,6 +134,8 @@ class PrepareDataTests(unittest.TestCase):
             self.assertEqual(list(normalized['options']), ['A', 'B'] if name != 'medmcqa' else list('ABCD'))
         with self.assertRaises(ValueError):
             m.normalize_evaluation('medmcqa', {**cases[1][1], 'cop': -1}, 0, 'validation')
+        with self.assertRaises(ValueError):
+            m.normalize_evaluation('medqa', {**cases[0][1], 'options': {'A': '', 'B': 'b'}}, 0, 'test')
 
     def test_balanced_budget_is_exact_and_explicit_when_insufficient(self):
         m = module()

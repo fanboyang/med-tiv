@@ -73,7 +73,13 @@ def medprm_records(rows, excluded_questions=(), source_split='train'):
         options = row.get('options')
         if not isinstance(options, list) or not 2 <= len(options) <= 26:
             raise ValueError(f'row {row_idx}: options 必须是选项列表')
-        rendered = '\n'.join(f'({chr(65+i)}) {text(o, "option")}' for i, o in enumerate(options))
+        # 固定revision中存在上游解析损坏的空字符串；保留原字母与原文本，
+        # 不删除、不补全、不用参考答案修复。此规则仅用于原始MedPRM训练数据。
+        for option_idx, option in enumerate(options):
+            if not isinstance(option, str):
+                raise ValueError(f'row {row_idx}, option {option_idx}: 必须为字符串')
+        empty_option_indices = [i for i, option in enumerate(options) if not option.strip()]
+        rendered = '\n'.join(f'({chr(65+i)}) {option}' for i, option in enumerate(options))
         solutions = row.get('solutions')
         if not isinstance(solutions, list):
             raise ValueError(f'row {row_idx}: solutions 必须是列表')
@@ -95,6 +101,9 @@ def medprm_records(rows, excluded_questions=(), source_split='train'):
                     'original_data_source': str(row.get('data_source', '')),
                     'source_split': 'train', 'split': '',
                     'label_source': 'solutions.orm_label',
+                    'empty_option_indices': empty_option_indices,
+                    'source_option_count': len(options),
+                    'unusual_option_count': len(options) not in (3, 4, 5),
                 },
             }
 
@@ -188,6 +197,24 @@ def load_source(source, config, cache_dir=None, offline=False, local_path=None):
                         download_config=DownloadConfig(local_files_only=offline))
 
 
+def data_quality_summary(records):
+    quality = {}
+    for issue, predicate in (
+        ('empty_options', lambda info: bool(info['empty_option_indices'])),
+        ('unusual_option_count', lambda info: info['unusual_option_count']),
+    ):
+        affected = [r for r in records if predicate(r['extra_info'])]
+        question_ids = sorted({r['extra_info']['question_id'] for r in affected})
+        quality[issue] = {'questions': len(question_ids), 'traces': len(affected),
+                          'question_ids': question_ids}
+    unusual_questions = {r['extra_info']['question_id']: r['extra_info']['source_option_count']
+                         for r in records if r['extra_info']['unusual_option_count']}
+    quality['unusual_question_option_counts'] = unusual_questions
+    quality['policy'] = 'retain original strings and option letters; no reconstruction or sample removal'
+    quality['scope'] = 'retained MedPRM trace pool after evaluation-question exclusion, before split'
+    return quality
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-dir', type=Path, required=True)
@@ -227,6 +254,11 @@ def main(argv=None):
         manifest['evaluation_counts'][name] = count
     dataset = load_source(MEDPRM, MEDPRM['config'], args.cache_dir, args.offline, local_sources.get('medprm'))
     records = list(medprm_records(dataset, excluded_questions=eval_questions))
+    quality = data_quality_summary(records)
+    manifest['medprm_data_quality'] = quality
+    if quality['empty_options']['traces'] or quality['unusual_option_count']['traces']:
+        print('WARNING: MedPRM source has malformed options; preserved unchanged: '
+              + json.dumps(quality, ensure_ascii=False), flush=True)
     train, validation = split_by_question(records, args.validation_fraction, args.seed)
     manifest['available_train_traces'] = len(train)
     if args.train_budget is not None:
