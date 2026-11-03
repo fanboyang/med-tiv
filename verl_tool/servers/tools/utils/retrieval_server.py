@@ -389,6 +389,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--retriever_model", type=str, default="intfloat/e5-base-v2", help="Path of the retriever model."
     )
+    parser.add_argument("--retrieval_pooling_method", choices=["mean", "cls", "pooler"], default="mean")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--faiss_gpu", action="store_true", help="Use GPU for computation")
     parser.add_argument("--port", type=int, default=8000, help="Port to run the server on")  # NEW
 
@@ -403,7 +405,7 @@ if __name__ == "__main__":
         retrieval_topk=args.topk,
         faiss_gpu=args.faiss_gpu,
         retrieval_model_path=args.retriever_model,
-        retrieval_pooling_method="mean",
+        retrieval_pooling_method=args.retrieval_pooling_method,
         retrieval_query_max_length=256,
         retrieval_use_fp16=True,
         retrieval_batch_size=512,
@@ -413,4 +415,4 @@ if __name__ == "__main__":
     retriever = get_retriever(config)
 
     # 3) Launch the server with configurable port
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")  # CHANGED
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")  # CHANGED
